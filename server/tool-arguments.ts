@@ -12,26 +12,13 @@ import type { HookApi } from '@earendil-works/pi-durable'
 import { traceContext } from './trace.ts'
 import type { CallTrace } from './trace.ts'
 
-/**
- * Whitespace characters in a row past which a tool call's arguments count as degenerate. JSON never needs that much,
- * and inside a string a file's newlines arrive escaped, so even a large `write` stays far below it. Runs inside strings
- * count too: the degenerate streams seen so far pad an unterminated string, so only a line of over 1000 spaces in a
- * legitimate value would trip it.
- */
 export const MAX_WHITESPACE_RUN = 1000
 
-/** Records one model call: the trace's `begin`, and the conversation of a provider session id, when known. */
 export type ModelTrace = {
   begin: CallTrace['begin']
   conversationOf(sessionId: string | undefined): number | undefined
 }
 
-/**
- * Model calls of `trace`, linked to their conversations. Pi sends a conversation's provider session id (`pi.provider`)
- * with each generation and compaction request but runs them outside any traced call, so the `model-trace` extension's
- * `beforeRequest` hook maps each session id to its conversation; a request before its conversation's first generation
- * in this process (a compaction right after a restart) and extensions' own calls stay unlinked.
- */
 export function modelTrace(trace: Pick<CallTrace, 'begin'>) {
   const sessions = new Map<string, number>()
   const remember = async (api: HookApi, context: Context) => {
@@ -58,23 +45,122 @@ export function modelTrace(trace: Pick<CallTrace, 'begin'>) {
   } satisfies ModelTrace & { extension: unknown }
 }
 
-/**
- * `models` whose `streamSimple` ends a response with an error as soon as a tool call's arguments degenerate, instead of
- * streaming whitespace until the request times out. The error is retryable, so the generation's retry policy decides.
- * With `trace`, every stream becomes one `model` row: provider/model, duration, token counts and stop reason, never
- * the prompt or the response.
- */
+const PROVIDER_LIMITS: Record<string, number> = {
+  'cirthan-dev': 3,
+  cirthan: 3,
+}
+
+class ProviderLimiter {
+  private active = new Map<string, number>()
+  private queues = new Map<string, (() => void)[]>()
+
+  async acquire(provider: string, signal?: AbortSignal): Promise<() => void> {
+    const limit = PROVIDER_LIMITS[provider] ?? Infinity
+    if (limit === Infinity) return () => {}
+
+    for (;;) {
+      const current = this.active.get(provider) ?? 0
+      if (current < limit) {
+        this.active.set(provider, current + 1)
+        let released = false
+        return () => {
+          if (released) return
+          released = true
+          const nextCount = (this.active.get(provider) ?? 1) - 1
+          if (nextCount <= 0) this.active.delete(provider)
+          else this.active.set(provider, nextCount)
+          const queue = this.queues.get(provider)
+          if (queue && queue.length > 0) {
+            const next = queue.shift()!
+            if (!queue.length) this.queues.delete(provider)
+            next()
+          }
+        }
+      }
+
+      await new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) return reject(signal.reason)
+        const onAbort = () => {
+          const queue = this.queues.get(provider)
+          if (queue) {
+            const idx = queue.indexOf(resume)
+            if (idx >= 0) queue.splice(idx, 1)
+            if (!queue.length) this.queues.delete(provider)
+          }
+          reject(signal?.reason)
+        }
+        const resume = () => {
+          signal?.removeEventListener('abort', onAbort)
+          resolve()
+        }
+        signal?.addEventListener('abort', onAbort, { once: true })
+        let queue = this.queues.get(provider)
+        if (!queue) {
+          queue = []
+          this.queues.set(provider, queue)
+        }
+        queue.push(resume)
+      })
+    }
+  }
+}
+
+const limiter = new ProviderLimiter()
+
 export function guardToolArguments<T extends Models>(models: T, trace?: ModelTrace): T {
   const streamSimple: Models['streamSimple'] = (model, context, options) => {
     const stream = guardStream(
-      (signal) => models.streamSimple(model, context, { ...options, signal }),
+      (signal) => {
+        const guarded = createAssistantMessageEventStream()
+        const run = async () => {
+          let release: (() => void) | undefined
+          try {
+            release = await limiter.acquire(model.provider, signal)
+            const inner = models.streamSimple(model, context, { ...options, signal })
+            for await (const event of inner) {
+              guarded.push(event)
+            }
+            guarded.end(await inner.result())
+          } catch (err: unknown) {
+            guarded.push({
+              type: 'error',
+              reason: 'error',
+              error: {
+                role: 'assistant',
+                content: [],
+                api: model.api,
+                provider: model.provider,
+                model: model.id,
+                usage: {
+                  input: 0,
+                  output: 0,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  totalTokens: 0,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                },
+                stopReason: 'error',
+                timestamp: Date.now(),
+                errorMessage: err instanceof Error ? err.message : String(err),
+              },
+            })
+            guarded.end()
+          } finally {
+            release?.()
+          }
+        }
+        void run().catch((error: unknown) => {
+          // Stream error is already reported on guarded stream
+          console.error('model stream failure:', error)
+        })
+        return guarded
+      },
       model,
       options?.signal,
     )
     if (trace) record(trace, stream, model, options?.sessionId)
     return stream
   }
-  // The target's own completeSimple calls its streamSimple on itself, past this proxy: route it through ours.
   const completeSimple: Models['completeSimple'] = (model, context, options) =>
     streamSimple(model, context, options).result()
   return new Proxy(models, {
@@ -87,7 +173,6 @@ export function guardToolArguments<T extends Models>(models: T, trace?: ModelTra
   })
 }
 
-/** One trace row for `stream`, written once it settles. */
 function record(
   trace: ModelTrace,
   stream: AssistantMessageEventStream,
@@ -95,12 +180,9 @@ function record(
   sessionId: string | undefined,
 ) {
   const conversationId = trace.conversationOf(sessionId)
-  // Pi's requests start a trace: the scheduler runs them in whatever context last woke it, which is no caller of
-  // theirs. An extension's own call belongs to the call it runs in.
   const { finish } = trace.begin(
     {
       kind: 'model',
-      // Pi's generation and compaction send the conversation's provider session; extension calls send none.
       caller: sessionId === undefined ? 'extension' : 'agent',
       callee: model.provider,
       name: `${model.provider}/${model.id}`,
@@ -121,10 +203,6 @@ function record(
   )
 }
 
-/**
- * Error codes a model failure row may name: provider and OAuth codes, network errors and a few plain words. A fixed
- * list, so nothing of a prompt, a response body or a credential can pass. Mirrors `KNOWN` in extensions/health/store.ts.
- */
 const CODES = new Set([
   'invalid_grant',
   'invalid_token',
@@ -163,11 +241,6 @@ const CODES = new Set([
   'EAI_AGAIN',
 ])
 
-/**
- * What a failed model row stores instead of the provider's message, which can echo the request: the stop reason, then
- * the HTTP status when the message starts with one or names it (`status 401`, `HTTP 429`) and the allowlisted codes it
- * contains, in order, at most four.
- */
 export function classify(stopReason: string, message = '') {
   const parts = [stopReason]
   const status = /^\s*([45]\d\d)\b|\b(?:status|http)[\s:=]*([45]\d\d)\b/i.exec(message)
@@ -180,7 +253,6 @@ export function classify(stopReason: string, message = '') {
   return parts.join(' ')
 }
 
-/** The stream `open` returns, ended with an error and aborted once a tool call's arguments degenerate. */
 export function guardStream(
   open: (signal: AbortSignal) => AssistantMessageEventStream,
   model: Pick<Model<Api>, 'api' | 'provider' | 'id'>,
@@ -225,8 +297,6 @@ export function guardStream(
           controller.abort()
           const call = event.partial.content[event.contentIndex]
           const name = call?.type === 'toolCall' ? `${call.name} ` : ''
-          // Pi's retry classification matches "you can retry your request"; a new sample rarely degenerates again.
-          // Pi upstream: @earendil-works/pi-ai@1.5.0 src/utils/retry.ts — RETRYABLE_PROVIDER_ERROR_PATTERN decides which errors a generation retries. Drop when Pi Durable lets a stream mark its error retryable.
           const errorMessage = `Aborted degenerate tool-call arguments: ${name}arguments contain more than ${MAX_WHITESPACE_RUN} whitespace characters in a row; you can retry your request`
           fail(errorMessage)
           return
@@ -235,7 +305,6 @@ export function guardStream(
       guarded.push(event)
       if (event.type === 'done' || event.type === 'error') return guarded.end()
     }
-    // A source may also settle by its result alone, without a terminal event.
     guarded.end(await source.result())
   })().catch((error: unknown) => {
     fail(`Model stream failed: ${String(error)}`)
