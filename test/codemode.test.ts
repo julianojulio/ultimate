@@ -804,6 +804,21 @@ it('persists store over two calls and harness close/reopen; discards failed writ
   expect(truncated.text).toContain('Output truncated')
 })
 
+it('pauses on wait(ms), since the sandbox has no timers', async () => {
+  const { server } = await fixture()
+  const agent = await server.root.agent(context)
+  const description = agent.tools.find((item) => item.name === 'codemode')!.description
+  expect(description).toContain('wait(ms)')
+  expect(description).toContain('`setTimeout` is not defined')
+  // The host owns the clock: only a real pause makes the wall clock move here, as the script's Date.now() does not.
+  const started = Date.now()
+  const waited = await run(server, `await wait(120); return 'waited';`)
+  expect(waited.data.details.value).toBe('waited')
+  expect(Date.now() - started).toBeGreaterThanOrEqual(120)
+  const bad = await run(server, `await wait('soon'); return 'not reached';`)
+  expect(bad.data.details.error).toContain('wait(ms) takes a number of milliseconds')
+})
+
 it('aborts nested work without committing store writes', async () => {
   const { server } = await fixture()
   server.host.faux!.setResponses([

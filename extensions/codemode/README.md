@@ -69,6 +69,8 @@ Entry/search limits default to 100 and must be 1–1000. Pagination of raw entri
 
 `store(key, value)` / `load(key)` use the conversation document `codemode.store` (rewindable, fork as-of). Values are loaded before every script. Store writes are saved only when the script finishes successfully; a yielded wait discards them. The document is exported in `docs` for SSE subscriptions.
 
+The sandbox has no timers: `setTimeout` is not defined, so `await wait(ms)` is the only way to let time pass. The host owns the clock and resolves it, and the wait rejects when the script is aborted.
+
 **Crash window:** Pi Durable has no result-transaction callback. Store writes use a separate `api.commit()` immediately before returning success. A crash between that commit and durable tool settlement retains the writes while the model may be told the script was **interrupted**. Do not treat store updates as atomic receipts of external side effects.
 
 ## Summaries

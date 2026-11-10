@@ -435,7 +435,7 @@ function globals(
       },
     },
   ]
-  return helpers.map((helper) => ({
+  const tools: CodemodeTool[] = helpers.map((helper) => ({
     ...helper,
     name: `ultimate.${helper.name}`,
     spread: true,
@@ -453,6 +453,32 @@ function globals(
       }
     },
   }))
+  // The sandbox has no timers, so a script that lets time pass waits through the host, which owns the clock.
+  tools.push({
+    name: 'wait',
+    description:
+      'Pause the script for ms milliseconds: the sandbox has no timers and `setTimeout` is not defined.',
+    signature: '(ms: number): Promise<void>',
+    spread: true,
+    outputSchema: {},
+    execute: (args, { signal }) => {
+      const ms = (args as unknown[])[0]
+      if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0)
+        throw new Error('wait(ms) takes a number of milliseconds, 0 or more')
+      return new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, ms)
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer)
+            reject(new Error('The wait was aborted'))
+          },
+          { once: true },
+        )
+      })
+    },
+  })
+  return tools
 }
 
 export const actions = {
@@ -480,7 +506,7 @@ export default function codemode(host: ExtensionHost) {
     name: 'codemode',
     replay: 'unsafe',
     description:
-      'Run an async JavaScript function body in a QuickJS/WASM sandbox. Call tools.<name>(args), use Promise.all for parallel calls, text()/console.log() for output, return for JSON, store(key,value)/load(key) for durable conversation values (at most 256K characters of JSON per value, 1M in all). Store writes are saved only when the script finishes successfully; a yielded wait discards them. No host I/O except injected functions. Nested results stay out of model context. Nested tool hooks do not run. Optional first line: // @options: {"timeout_ms":60000,"max_output_tokens":10000}.\n\n' +
+      'Run an async JavaScript function body in a QuickJS/WASM sandbox. Call tools.<name>(args), use Promise.all for parallel calls, text()/console.log() for output, return for JSON, store(key,value)/load(key) for durable conversation values (at most 256K characters of JSON per value, 1M in all). Store writes are saved only when the script finishes successfully; a yielded wait discards them. No timers: `wait(ms)` pauses the script, and `setTimeout` is not defined. No host I/O except injected functions. Nested results stay out of model context. Nested tool hooks do not run. Optional first line: // @options: {"timeout_ms":60000,"max_output_tokens":10000}.\n\n' +
       renderDeclarations({ globals: globalDeclarations }),
     parameters: obj({ code: str() }),
     async execute({ code: source }, api, context) {
