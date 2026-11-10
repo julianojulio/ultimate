@@ -810,7 +810,7 @@ it('pauses on wait(ms), since the sandbox has no timers', async () => {
   const description = agent.tools.find((item) => item.name === 'codemode')!.description
   expect(description).toContain('wait(ms)')
   expect(description).toContain('`setTimeout` is not defined')
-  // The host owns the clock: only a real pause makes the wall clock move here, as the script's Date.now() does not.
+  // Measured on the host around the whole run: the stubbed model and the script cost far less, so 120 ms of real time can only come from the host pausing.
   const started = Date.now()
   const waited = await run(server, `await wait(120); return 'waited';`)
   expect(waited.data.details.value).toBe('waited')
